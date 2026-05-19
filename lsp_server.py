@@ -92,16 +92,28 @@ class LSPSubprocess:
             args = [bin_path] + cfg["fallback_args"](self.workspace_root)
 
         logger.info("Starting LSP: %s", " ".join(str(a) for a in args))
+
+        # Redirect stderr to log file for debugging
+        log_dir = Path.home() / ".hermes" / "logs" / "lsp"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_path = log_dir / f"{self.lang}_{self.workspace_root.name}.log"
+        try:
+            stderr_file = open(stderr_path, "wb")
+        except OSError:
+            stderr_file = None
+
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=stderr_file or asyncio.subprocess.PIPE,
                 cwd=self.workspace_root,
             )
         except Exception as exc:
             logger.error("Failed to start LSP: %s", exc)
+            if stderr_file:
+                stderr_file.close()
             return False
 
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -185,6 +197,12 @@ class LSPSubprocess:
             time.sleep(0.1)
         with self._lock:
             return self._diagnostics.get(uri, [])
+
+    def get_log_path(self) -> Optional[Path]:
+        """Return path to stderr log file if available."""
+        log_dir = Path.home() / ".hermes" / "logs" / "lsp"
+        path = log_dir / f"{self.lang}_{self.workspace_root.name}.log"
+        return path if path.exists() else None
 
     # -- internals ----------------------------------------------------------
 
@@ -361,6 +379,14 @@ class LSPServerManager:
                         marker.write_text("module workspace\n")
                     elif markers[0] == "Cargo.toml":
                         marker.write_text("[package]\nname = \"workspace\"\nversion = \"0.1.0\"\n")
+                    elif markers[0].endswith(".csproj"):
+                        marker.write_text(
+                            '<Project Sdk="Microsoft.NET.Sdk">\n'
+                            '  <PropertyGroup>\n'
+                            '    <TargetFramework>net8.0</TargetFramework>\n'
+                            '  </PropertyGroup>\n'
+                            '</Project>\n'
+                        )
                     else:
                         marker.write_text("")
                     logger.info("Created marker file: %s", marker)
@@ -374,10 +400,19 @@ class LSPServerManager:
         await server.did_change(path, content, version=2)
         await server.did_save(path)
 
-        # Wait for diagnostics to arrive (pyright needs ~2-3s for first analysis)
-        await asyncio.sleep(3.0)
-        diags = server.get_diagnostics(path, timeout=5.0)
-        return {"diagnostics": diags}
+        # Wait for diagnostics to arrive
+        # OmniSharp needs longer for first analysis (~5-8s), pyright ~2-3s
+        wait_seconds = 8.0 if lang == "csharp" else 3.0
+        diag_timeout = 10.0 if lang == "csharp" else 5.0
+        logger.info("Waiting %.1fs for %s diagnostics...", wait_seconds, lang)
+        await asyncio.sleep(wait_seconds)
+        diags = server.get_diagnostics(path, timeout=diag_timeout)
+
+        result = {"diagnostics": diags}
+        log_path = server.get_log_path()
+        if log_path:
+            result["lsp_log"] = str(log_path)
+        return result
 
     async def _get_diagnostics(self, lang: str, workspace_root: str, file_path: str) -> Dict:
         server = await self.get_or_create(lang, workspace_root)
