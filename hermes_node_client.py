@@ -342,6 +342,10 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
     newline = params.get("newline", "\r\n")  # Windows default
 
     if content_b64:
+        # Fix base64 padding if necessary
+        padding_needed = 4 - len(content_b64) % 4
+        if padding_needed != 4:
+            content_b64 += "=" * padding_needed
         raw = base64.b64decode(content_b64)
         with open(path, "wb") as f:
             f.write(raw)
