@@ -51,6 +51,11 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+# Suppress websockets library debug logs BEFORE importing websockets
+# to prevent cp932 encoding errors when binary frame data is logged
+# on Japanese Windows systems
+logging.getLogger("websockets").setLevel(logging.WARNING)
+
 import websockets
 
 # ---------------------------------------------------------------------------
