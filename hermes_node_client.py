@@ -44,6 +44,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# Fix Windows console encoding to UTF-8 before any I/O happens
+if sys.platform == "win32":
+    import io
+    # Force UTF-8 for stdout/stderr to avoid cp932 UnicodeEncodeError
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import websockets
 
 # ---------------------------------------------------------------------------
