@@ -891,10 +891,6 @@ async def _terminal_write(proxy_id: str, params: dict[str, Any]) -> dict[str, An
     except Exception:
         data = data_b64  # fallback: treat as plain text
 
-    # Convert CR to LF for PTY compatibility
-    # Also handle CRLF -> LF to avoid double newlines
-    data = data.replace("\r\n", "\n").replace("\r", "\n")
-
     session["last_activity"] = time.time()
 
     # Windows PTY mode (pywinpty)
