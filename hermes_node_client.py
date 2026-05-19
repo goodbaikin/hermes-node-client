@@ -47,6 +47,31 @@ from typing import Any
 import websockets
 
 # ---------------------------------------------------------------------------
+# Load .env file from the same directory as this script
+# ---------------------------------------------------------------------------
+def _load_dotenv():
+    """Load environment variables from .env file next to this script."""
+    script_dir = Path(__file__).resolve().parent
+    env_file = script_dir / ".env"
+    if not env_file.exists():
+        return
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        pass
+
+_load_dotenv()
+
+# ---------------------------------------------------------------------------
 # Logging setup (Windows Event Log friendly)
 # ---------------------------------------------------------------------------
 logging.basicConfig(
