@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 LSP_REGISTRY: Dict[str, Dict[str, Any]] = {
     "csharp": {
         "bin": "roslyn-language-server",
-        "args": ["--stdio", "--autoLoadProjects"],
+        "args": ["--stdio", "--autoLoadProjects", "--logLevel", "Debug"],
         "root_markers": [".sln", ".csproj"],
     },
     "python": {
