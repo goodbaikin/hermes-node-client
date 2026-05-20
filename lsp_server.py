@@ -445,7 +445,7 @@ class LSPServerManager:
         await server.did_save(path)
 
         # Wait for diagnostics to arrive
-        wait_seconds = 20.0
+        wait_seconds = 60.0
         diag_timeout = 10.0
         logger.info("Waiting %.1fs for %s diagnostics...", wait_seconds, lang)
         await asyncio.sleep(wait_seconds)
