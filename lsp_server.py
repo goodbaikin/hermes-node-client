@@ -93,7 +93,7 @@ class LSPSubprocess:
         log_dir.mkdir(parents=True, exist_ok=True)
         stderr_path = log_dir / f"{self.lang}_{self.workspace_root.name}.log"
         try:
-            stderr_file = open(stderr_path, "wb")
+            stderr_file = open(stderr_path, "ab")
         except OSError:
             stderr_file = None
 
