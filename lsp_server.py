@@ -346,6 +346,12 @@ class LSPSubprocess:
             with self._lock:
                 self._diagnostics[uri] = diags
             logger.debug("Diagnostics for %s: %d items", uri, len(diags))
+        elif method == "window/logMessage":
+            params = msg.get("params", {})
+            msg_type = params.get("type", 0)
+            message = params.get("message", "")
+            log_level = {1: "ERROR", 2: "WARNING", 3: "INFO", 4: "DEBUG"}.get(msg_type, "UNKNOWN")
+            logger.info("Roslyn [%s]: %s", log_level, message)
 
     @staticmethod
     def _path_to_uri(path: str) -> str:
