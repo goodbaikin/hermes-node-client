@@ -230,6 +230,18 @@ class LSPSubprocess:
             return found
         # 3. common Windows locations
         if sys.platform == "win32":
+            # For dotnet tools like roslyn-language-server, resolve .exe directly
+            # (asyncio.create_subprocess_exec cannot run .cmd wrappers)
+            if name == "roslyn-language-server":
+                dotnet_tools = Path.home() / ".dotnet" / "tools"
+                # Find the actual .exe under .store
+                store_dir = dotnet_tools / ".store" / "roslyn-language-server"
+                if store_dir.exists():
+                    for version_dir in store_dir.iterdir():
+                        exe = version_dir / f"roslyn-language-server.win-x64" / version_dir.name / "tools" / "net10.0" / "win-x64" / "Microsoft.CodeAnalysis.LanguageServer.exe"
+                        if exe.exists():
+                            return str(exe)
+            
             for base in [
                 Path(os.environ.get("LOCALAPPDATA", "")) / "npm",
                 Path(os.environ.get("APPDATA", "")) / "npm",
