@@ -265,7 +265,7 @@ class LSPSubprocess:
         self._pending[msg_id] = future
         await self._write({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
         try:
-            return await asyncio.wait_for(future, timeout=10.0)
+            return await asyncio.wait_for(future, timeout=60.0)
         except asyncio.TimeoutError:
             self._pending.pop(msg_id, None)
             return None
