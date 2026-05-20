@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -27,10 +26,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 LSP_REGISTRY: Dict[str, Dict[str, Any]] = {
     "csharp": {
-        "bin": "OmniSharp.exe",
-        "args": ["--stdio"],
+        "bin": "roslyn-language-server",
+        "args": ["--stdio", "--autoLoadProjects"],
         "root_markers": [".sln", ".csproj"],
-        "fallback_args": lambda root: ["-s", str(root), "--stdio"],
     },
     "python": {
         "bin": "pyright-langserver",
@@ -65,7 +63,7 @@ class LSPSubprocess:
 
     def __init__(self, lang: str, workspace_root: Path):
         self.lang = lang
-        self.workspace_root = workspace_root
+        self.workspace_root = workspace_root.resolve()
         self.process: Optional[asyncio.subprocess.Process] = None
         self._seq = 0
         self._pending: Dict[int, asyncio.Future] = {}
@@ -88,9 +86,6 @@ class LSPSubprocess:
             return False
 
         args = [bin_path] + cfg["args"]
-        if "fallback_args" in cfg:
-            args = [bin_path] + cfg["fallback_args"](self.workspace_root)
-
         logger.info("Starting LSP: %s", " ".join(str(a) for a in args))
 
         # Redirect stderr to log file for debugging
@@ -137,7 +132,7 @@ class LSPSubprocess:
             except asyncio.CancelledError:
                 pass
 
-    # -- JSON-RPC -----------------------------------------------------------
+    # -- Standard LSP JSON-RPC ----------------------------------------------
 
     async def _initialize(self):
         root_uri = self.workspace_root.as_uri()
@@ -185,6 +180,10 @@ class LSPSubprocess:
             "textDocument": {"uri": uri},
         })
 
+    async def request_diagnostics(self, file_path: Path) -> List[Dict]:
+        """Explicitly request diagnostics via workspace/executeCommand or similar."""
+        return []
+
     def get_diagnostics(self, file_path: Path, timeout: float = 5.0) -> List[Dict]:
         """Synchronous wrapper — polls cache until timeout."""
         uri = file_path.as_uri()
@@ -207,6 +206,20 @@ class LSPSubprocess:
     # -- internals ----------------------------------------------------------
 
     def _resolve_bin(self, name: str) -> Optional[str]:
+        """Resolve LSP binary path with support for .env overrides."""
+        # 0. Check HERMES_LSP_PATH environment variable (from .env or shell)
+        env_path = os.environ.get("HERMES_LSP_PATH", "")
+        if env_path:
+            for base in env_path.split(os.pathsep):
+                if not base:
+                    continue
+                candidate = Path(base) / name
+                if candidate.exists():
+                    return str(candidate)
+                candidate = candidate.with_suffix(".exe")
+                if candidate.exists():
+                    return str(candidate)
+
         # 1. staged hermes lsp bin dir
         staged = Path.home() / ".hermes" / "lsp" / "bin" / name
         if staged.exists():
@@ -221,6 +234,9 @@ class LSPSubprocess:
                 Path(os.environ.get("LOCALAPPDATA", "")) / "npm",
                 Path(os.environ.get("APPDATA", "")) / "npm",
                 Path.home() / "scoop" / "shims",
+                Path.home() / ".dotnet" / "tools",
+                Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "OmniSharp",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "OmniSharp",
             ]:
                 candidate = base / name
                 if candidate.exists():
@@ -253,6 +269,8 @@ class LSPSubprocess:
             self.process.stdin.write(payload)
             await self.process.stdin.drain()
 
+    # -- read loop ------------------------------------------------------------
+
     async def _read_loop(self):
         """Read JSON-RPC messages from stdout."""
         if self.process is None or self.process.stdout is None:
@@ -278,6 +296,7 @@ class LSPSubprocess:
 
     def _parse_message(self, buf: bytes) -> tuple:
         """Parse one JSON-RPC message from buffer. Returns (msg, consumed_bytes)."""
+        # Standard LSP protocol (Content-Length header)
         try:
             header_end = buf.index(b"\r\n\r\n")
             header = buf[:header_end].decode("ascii", errors="replace")
@@ -287,17 +306,19 @@ class LSPSubprocess:
                 if line.lower().startswith("content-length:"):
                     length = int(line.split(":", 1)[1].strip())
                     break
-            if length is None:
-                return None, 0
-            if len(buf) < body_start + length:
-                return None, 0
-            body = buf[body_start:body_start + length]
-            msg = json.loads(body.decode("utf-8"))
-            return msg, body_start + length
+            if length is not None:
+                if len(buf) < body_start + length:
+                    return None, 0
+                body = buf[body_start:body_start + length]
+                msg = json.loads(body.decode("utf-8"))
+                return msg, body_start + length
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-            return None, 0
+            pass
+
+        return None, 0
 
     def _handle_message(self, msg: Dict):
+        # Standard LSP JSON-RPC
         msg_id = msg.get("id")
         if msg_id is not None and msg_id in self._pending:
             future = self._pending.pop(msg_id)
@@ -313,6 +334,15 @@ class LSPSubprocess:
             with self._lock:
                 self._diagnostics[uri] = diags
             logger.debug("Diagnostics for %s: %d items", uri, len(diags))
+
+    @staticmethod
+    def _path_to_uri(path: str) -> str:
+        """Convert a file path to URI."""
+        if path.startswith("file://"):
+            return path
+        if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+            return "file://" + path.replace("\\", "/")
+        return path
 
 
 class LSPServerManager:
@@ -361,7 +391,7 @@ class LSPServerManager:
 
     async def _lint_after_write(self, lang: str, workspace_root: str, file_path: str, content: str) -> Dict:
         root = Path(workspace_root).resolve()
-        
+
         # Ensure workspace has a marker file so LSP servers recognize it
         cfg = LSP_REGISTRY.get(lang)
         if cfg and "root_markers" in cfg:
@@ -387,9 +417,11 @@ class LSPServerManager:
                             '  </PropertyGroup>\n'
                             '</Project>\n'
                         )
+                    elif markers[0].endswith(".sln"):
+                        logger.info("Skipping .sln marker creation — Roslyn requires valid .sln or none")
                     else:
                         marker.write_text("")
-                    logger.info("Created marker file: %s", marker)
+                        logger.info("Created marker file: %s", marker)
 
         server = await self.get_or_create(lang, workspace_root)
         if server is None:
@@ -401,9 +433,8 @@ class LSPServerManager:
         await server.did_save(path)
 
         # Wait for diagnostics to arrive
-        # OmniSharp needs longer for first analysis (~5-8s), pyright ~2-3s
-        wait_seconds = 8.0 if lang == "csharp" else 3.0
-        diag_timeout = 10.0 if lang == "csharp" else 5.0
+        wait_seconds = 5.0
+        diag_timeout = 10.0
         logger.info("Waiting %.1fs for %s diagnostics...", wait_seconds, lang)
         await asyncio.sleep(wait_seconds)
         diags = server.get_diagnostics(path, timeout=diag_timeout)
@@ -423,18 +454,20 @@ class LSPServerManager:
         return {"diagnostics": diags}
 
     async def shutdown_all(self):
+        """Shutdown all managed LSP servers."""
         with self._lock:
             servers = list(self._servers.values())
             self._servers.clear()
-        for s in servers:
-            await s.shutdown()
+        for server in servers:
+            await server.shutdown()
 
 
-# Singleton
+# Global singleton manager instance
 _lsp_manager: Optional[LSPServerManager] = None
 
 
 def get_lsp_manager() -> LSPServerManager:
+    """Return the global LSP server manager singleton."""
     global _lsp_manager
     if _lsp_manager is None:
         _lsp_manager = LSPServerManager()

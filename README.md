@@ -64,7 +64,7 @@ hermes_node_client.py ──► handle_lsp()
 lsp_server.py ──► LSPServerManager
     │
     ▼
-OmniSharp ──► textDocument/didOpen ──► 診断計算
+csharp-ls ──► textDocument/didOpen ──► 診断計算
     │
     ▼
 textDocument/publishDiagnostics ──► キャッシュ
@@ -84,12 +84,12 @@ lint_after_write(language="csharp", workspace_root="C:/.../COCONV.Deploy")
     ▼
 LSPSubprocess.start()
     │
-    ├── バイナリ検索: OmniSharp.exe
-    │   ├── ~/.hermes/lsp/bin/OmniSharp.exe
+    ├── バイナリ検索: csharp-ls
+    │   ├── ~/.hermes/lsp/bin/csharp-ls
     │   ├── PATH
-    │   └── %LOCALAPPDATA%/npm, scoop/shims
+    │   └── %USERPROFILE%/.dotnet/tools
     │
-    ├── プロセス起動: OmniSharp.exe -s COCONV.Deploy.sln --stdio
+    ├── プロセス起動: csharp-ls (stdio by default)
     │
     ├── initialize 送信
     │   {"rootUri": "file:///C:/.../COCONV.Deploy", ...}
@@ -102,7 +102,7 @@ LSPSubprocess.start()
 | 言語 | サーバー | インストール |
 |---|---|---|
 | Python | pyright | `npm install -g pyright` |
-| C# | OmniSharp | 手動ダウンロード or `hermes lsp install csharp-ls` |
+| C# | csharp-ls | `dotnet tool install --global csharp-ls` |
 | TypeScript | typescript-language-server | `npm install -g typescript-language-server` |
 | Rust | rust-analyzer | `rustup component add rust-analyzer` |
 | Go | gopls | `go install golang.org/x/tools/gopls@latest` |
@@ -112,16 +112,13 @@ LSPSubprocess.start()
 ### node_client 側（dev-win01）
 
 ```powershell
-# OmniSharp のインストール
-# 1. GitHub Releases からダウンロード
-# https://github.com/OmniSharp/omnisharp-roslyn/releases
+# csharp-ls のインストール（.NET SDK 必須）
+dotnet tool install --global csharp-ls
 
-# 2. 展開して PATH に追加
-$env:PATH += ";C:\Tools\OmniSharp"
-
-# 3. または hermes lsp bin ディレクトリ
+# または hermes lsp bin ディレクトリ
 mkdir ~/.hermes/lsp/bin
-copy OmniSharp.exe ~/.hermes/lsp/bin/
+# dotnet tools のパスを確認してコピー
+# 通常: %USERPROFILE%\.dotnet\tools\csharp-ls.exe
 ```
 
 ### Hermes 側（config.yaml）
@@ -216,7 +213,7 @@ asyncio.run(test())
 | `Failed to start LSP for python` | pyright 未インストール | `npm install -g pyright` |
 | 診断が空 | マーカーファイル不足 | 自動作成されるはず。手動で `pyproject.toml` 作成 |
 | タイムアウト | 言語サーバー起動遅延 | `wait_timeout` を増やす |
-| `OmniSharp.exe not found` | PATH 未設定 | `~/.hermes/lsp/bin/` にコピー |
+| `csharp-ls not found` | .NET SDK 未インストール | `dotnet tool install --global csharp-ls` |
 
 ## 今後の拡張
 

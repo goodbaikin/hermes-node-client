@@ -133,22 +133,25 @@ Write-Host "Installing LSP servers..." -ForegroundColor Yellow
 Write-Host "  Python (pyright)..." -ForegroundColor Gray
 & $pip.Source install pyright
 
-# C# (OmniSharp)
-$omnisharpDir = Join-Path $InstallDir "omnisharp"
-if (-not (Test-Path $omnisharpDir)) {
-    Write-Host "  C# (OmniSharp)..." -ForegroundColor Gray
-    New-Item -ItemType Directory -Path $omnisharpDir -Force | Out-Null
-    $omnisharpUrl = "https://github.com/OmniSharp/omnisharp-roslyn/releases/latest/download/omnisharp-win-x64.zip"
-    $omnisharpZip = Join-Path $env:TEMP "omnisharp.zip"
-    Invoke-WebRequest -Uri $omnisharpUrl -OutFile $omnisharpZip
-    Expand-Archive -Path $omnisharpZip -DestinationPath $omnisharpDir -Force
-    Remove-Item $omnisharpZip
-
-    # Add to PATH
-    $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
-    if ($currentPath -notlike "*$omnisharpDir*") {
-        [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$omnisharpDir", "Machine")
+# C# (csharp-ls)
+Write-Host "  C# (csharp-ls)..." -ForegroundColor Gray
+$dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+if ($dotnet) {
+    & dotnet tool install --global csharp-ls 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    csharp-ls may already be installed, attempting update..." -ForegroundColor Yellow
+        & dotnet tool update --global csharp-ls 2>$null
     }
+    # Ensure ~/.dotnet/tools is in PATH
+    $dotnetToolsDir = Join-Path $env:USERPROFILE ".dotnet" "tools"
+    $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if ($currentPath -notlike "*$dotnetToolsDir*") {
+        [Environment]::SetEnvironmentVariable("PATH", "$currentPath;$dotnetToolsDir", "User")
+        Write-Host "    Added $dotnetToolsDir to PATH" -ForegroundColor Green
+    }
+    Write-Host "    csharp-ls installed/updated" -ForegroundColor Green
+} else {
+    Write-Warning ".NET SDK not found. Install from https://dotnet.microsoft.com/download to use csharp-ls"
 }
 
 Write-Host ""
