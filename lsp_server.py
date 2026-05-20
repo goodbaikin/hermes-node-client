@@ -429,7 +429,7 @@ class LSPServerManager:
 
         path = Path(file_path).resolve()
         await server.did_open(path, content, version=1)
-        await server.did_change(path, content, version=2)
+
         await server.did_save(path)
 
         # Wait for diagnostics to arrive
