@@ -106,7 +106,7 @@ class LSPSubprocess:
             "workspaceFolders": [{"uri": root_uri, "name": self.workspace_root.name}],
             "capabilities": {
                 "workspace": {
-                    "workspaceFolders": True,
+                    "workspaceFolders": False,
                     "configuration": True,
                     "didChangeConfiguration": {"dynamicRegistration": True},
                 },
@@ -118,6 +118,7 @@ class LSPSubprocess:
                         "willSaveWaitUntil": True,
                         "didSave": True,
                     },
+                    "rename": {"dynamicRegistration": False, "prepareSupport": False},
                 },
             },
         })

@@ -56,8 +56,8 @@ LSP_REGISTRY: Dict[str, LanguageConfig] = {
         wait_seconds=3.0,
     ),
     "powershell": LanguageConfig(
-        bin="pwsh",
-        args=["-Command", "Import-Module PowerShellEditorServices; Start-EditorServices -Stdio -LogLevel Normal"],
+        bin="",
+        args=[],
         root_markers=[".ps1", ".psm1", ".psd1"],
         wait_seconds=5.0,
         handler_module="powershell",
