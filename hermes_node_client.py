@@ -351,6 +351,9 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
         padding_needed = 4 - len(content_b64) % 4
         if padding_needed != 4:
             content_b64 += "=" * padding_needed
+        # Ensure content_b64 is ASCII string before decoding
+        if isinstance(content_b64, str):
+            content_b64 = content_b64.encode('ascii')
         raw = base64.b64decode(content_b64)
         with open(path, "wb") as f:
             f.write(raw)
@@ -636,6 +639,12 @@ async def handle_node_restart(params: dict[str, Any]) -> dict[str, Any]:
 
     logger.info("[%s] Spawning restart process: %s", NODE_ID, args)
 
+    # Redirect stdout/stderr to log files so pythonw has valid file descriptors
+    log_dir = Path.home() / ".hermes" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out_log = open(log_dir / "node_client.log", "a")
+    err_log = open(log_dir / "node_client.err", "a")
+
     # Start new process detached (no console window on Windows)
     if sys.platform == "win32":
         subprocess.Popen(
@@ -646,12 +655,16 @@ async def handle_node_restart(params: dict[str, Any]) -> dict[str, Any]:
                 | subprocess.CREATE_NO_WINDOW
             ),
             close_fds=True,
+            stdout=out_log,
+            stderr=err_log,
         )
     else:
         subprocess.Popen(
             args,
             start_new_session=True,
             close_fds=True,
+            stdout=out_log,
+            stderr=err_log,
         )
 
     # Schedule self-termination after sending response
@@ -1405,8 +1418,9 @@ async def _connection_loop(ws, node_id: str) -> None:
         elif data.get("type") == "event" and data.get("event") == "node.terminal.data":
             asyncio.create_task(handle_terminal_data(ws, data["payload"]))
         elif data.get("type") == "event" and data.get("event") == "ping":
-            # Keepalive ping
-            pass
+            # Keepalive ping — respond with pong
+            await ws.send(json.dumps({"type": "event", "event": "pong"}))
+            continue
 
 
 async def connect_and_serve(gateway_url: str, token: str, node_id: str, api_server_url: str = "") -> None:
