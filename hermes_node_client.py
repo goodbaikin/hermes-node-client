@@ -159,20 +159,20 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     # On Windows: use PowerShell with UTF-8 encoding, bypassing cmd.exe AutoRun
     # Skip wrapping if the command already invokes PowerShell/pwsh directly
     if sys.platform == "win32" and not cmd.strip().lower().startswith(("powershell", "pwsh")):
-        # Use -Command instead of -EncodedCommand to preserve stderr correctly.
-        # Escape double quotes in the user command so they survive the outer
-        # argument list passed to create_subprocess_exec.
-        escaped_cmd = cmd.replace('"', '\\"')
+        # Use -EncodedCommand to avoid ALL escaping issues (\t, $, `, ", etc.).
+        # The script is Base64-encoded UTF-16 LE, so no shell metacharacter
+        # interpretation happens at the OS command-line level.
         ps_script = (
             '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
             '$OutputEncoding = [System.Text.Encoding]::UTF8; '
-            '$ErrorView = \"NormalView\"; '
-            f'{escaped_cmd}'
+            '$ErrorView = "NormalView"; '
+            f'{cmd}'
         )
+        encoded = base64.b64encode(ps_script.encode('utf-16-le')).decode('ascii')
         args = [
             _resolve_command("powershell"), "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass",
-            "-Command", ps_script,
+            "-EncodedCommand", encoded,
         ]
     else:
         args = [_resolve_command("bash"), "-c", cmd]
@@ -206,13 +206,41 @@ def _strip_clixml(text: str) -> str:
     """Remove PowerShell CLIXML serialization from stderr output.
 
     PowerShell serializes ErrorRecord objects to XML when stderr is redirected.
-    This strips the '#< CLIXML' header and the entire XML block that follows.
+    This strips the '#< CLIXML' header and the entire XML block that follows,
+    but extracts human-readable error messages from <S S="Error"> elements.
     """
     import re
-    # Match '#< CLIXML' followed by an XML block (Objs element)
+
+    # Fast path: no CLIXML at all
+    if '#<' not in text and '#<CLIXML' not in text:
+        return text
+
+    # Extract error strings from <S S="Error">...elements
+    error_strings = re.findall(
+        r'<S\s+S=["\']Error["\']\s*>(.*?)</S>',
+        text,
+        re.DOTALL | re.IGNORECASE
+    )
+
+    if error_strings:
+        # Decode _x000D_ / _x000A_ entities used by PowerShell CLIXML
+        decoded = []
+        for s in error_strings:
+            s = s.replace('_x000D_', '\r').replace('_x000A_', '\n')
+            # Skip lines that are just the script preamble (not actual errors)
+            skip_prefixes = (
+                '[Console]::OutputEncoding =',
+                '$OutputEncoding =',
+                '$ErrorView =',
+                '"NormalView"',
+            )
+            if s.strip() and not any(s.strip().startswith(p) for p in skip_prefixes):
+                decoded.append(s)
+        return '\n'.join(decoded).strip()
+
+    # Fallback: strip the entire XML block
     pattern = re.compile(r'#<\s*CLIXML\s*<Objs[^>]*>.*?</Objs>', re.DOTALL | re.IGNORECASE)
     cleaned = pattern.sub('', text)
-    # Also strip any remaining CLIXML header if XML parsing failed
     cleaned = cleaned.replace('#< CLIXML', '').replace('#<CLIXML', '')
     return cleaned.strip()
 
@@ -566,12 +594,12 @@ async def handle_signtool(params: dict[str, Any]) -> dict[str, Any]:
             f'"{file_path}"'
         )
     elif subject:
+        # Build raw PowerShell script; handle_terminal_exec will wrap it
+        # with -EncodedCommand, so no manual escaping needed.
         cmd = (
-            f'powershell.exe -Command "'
             f"$cert = Get-ChildItem Cert:\\LocalMachine\\My | "
             f"Where-Object {{ $_.Subject -eq 'CN={subject}' }} | Select-Object -First 1; "
             f"Set-AuthenticodeSignature -FilePath '{file_path}' -Certificate $cert -HashAlgorithm {hash_alg}"
-            f'"'
         )
     else:
         raise ValueError("thumbprint+signtoolPath or subject required")
@@ -590,12 +618,14 @@ async def handle_lsp(params: dict[str, Any]) -> dict[str, Any]:
         content: str (optional, for lint_after_write)
     """
     try:
-        from node_client.lsp_server import get_lsp_manager
+        from node_client.lsp import get_lsp_manager
     except ImportError:
-        # Fallback: try relative import if lsp_server.py is in same dir
+        # Fallback: try relative import if lsp package is in same dir
         import importlib.util
         script_dir = Path(__file__).parent
-        spec = importlib.util.spec_from_file_location("lsp_server", script_dir / "lsp_server.py")
+        spec = importlib.util.spec_from_file_location(
+            "node_client.lsp", script_dir / "lsp" / "__init__.py"
+        )
         if spec and spec.loader:
             lsp_mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(lsp_mod)
@@ -603,14 +633,14 @@ async def handle_lsp(params: dict[str, Any]) -> dict[str, Any]:
         else:
             # Second fallback: node_client/ sibling directory
             spec2 = importlib.util.spec_from_file_location(
-                "lsp_server", script_dir.parent / "node_client" / "lsp_server.py"
+                "node_client.lsp", script_dir.parent / "node_client" / "lsp" / "__init__.py"
             )
             if spec2 and spec2.loader:
                 lsp_mod = importlib.util.module_from_spec(spec2)
                 spec2.loader.exec_module(lsp_mod)
                 get_lsp_manager = lsp_mod.get_lsp_manager
             else:
-                return {"error": "lsp_server.py not found"}
+                return {"error": "lsp package not found"}
 
     mgr = get_lsp_manager()
     return await mgr.handle_request(params)
