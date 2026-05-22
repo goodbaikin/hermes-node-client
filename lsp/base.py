@@ -28,6 +28,7 @@ class LSPSubprocess:
         self._seq = 0
         self._pending: Dict[int, asyncio.Future] = {}
         self._diagnostics: Dict[str, List[Dict]] = {}  # uri -> diagnostics
+        self._diag_events: Dict[str, asyncio.Event] = {}  # uri -> event (new)
         self._lock = threading.Lock()
         self._reader_task: Optional[asyncio.Task] = None
         self._initialized = False
@@ -134,6 +135,8 @@ class LSPSubprocess:
             debug_log(f"[did_open] {uri} already open, closing first")
             await self.did_close(file_path)
             await asyncio.sleep(0.5)
+        # Clear diagnostic event before opening (new analysis incoming)
+        self._clear_diag_event(file_path)
         await self._send_notification("textDocument/didOpen", {
             "textDocument": {
                 "uri": uri,
@@ -165,6 +168,8 @@ class LSPSubprocess:
         if not self._initialized:
             return
         uri = file_path.as_uri()
+        # Clear diagnostic event before change (new analysis incoming)
+        self._clear_diag_event(file_path)
         await self._send_notification("textDocument/didChange", {
             "textDocument": {"uri": uri, "version": version},
             "contentChanges": [{"range": None, "text": content}],
@@ -174,6 +179,8 @@ class LSPSubprocess:
         if not self._initialized:
             return
         uri = file_path.as_uri()
+        # Clear diagnostic event before save (new analysis incoming)
+        self._clear_diag_event(file_path)
         await self._send_notification("textDocument/didSave", {
             "textDocument": {"uri": uri},
         })
@@ -216,6 +223,36 @@ class LSPSubprocess:
             time.sleep(0.1)
         with self._lock:
             return self._diagnostics.get(uri, [])
+
+    async def wait_for_diagnostics(self, file_path: Path, timeout: float = 5.0) -> List[Dict]:
+        """Event-driven wait for diagnostics. Returns immediately when push diagnostics arrive."""
+        uri = file_path.as_uri()
+        with self._lock:
+            event = self._diag_events.get(uri)
+            if event is None:
+                event = asyncio.Event()
+                self._diag_events[uri] = event
+            # If we already have diagnostics, return immediately
+            existing = self._diagnostics.get(uri, [])
+            if existing:
+                return existing
+            event.clear()
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+        with self._lock:
+            return self._diagnostics.get(uri, [])
+
+    def _clear_diag_event(self, file_path: Path):
+        """Clear the diagnostic event before triggering a new analysis."""
+        uri = file_path.as_uri()
+        with self._lock:
+            event = self._diag_events.get(uri)
+            if event is not None:
+                event.clear()
 
     def is_alive(self) -> bool:
         if self.process is None:
@@ -416,6 +453,10 @@ class LSPSubprocess:
             diags = params.get("diagnostics", [])
             with self._lock:
                 self._diagnostics[uri] = diags
+                # Signal any waiting event-driven consumers
+                event = self._diag_events.get(uri)
+                if event is not None:
+                    event.set()
             logger.debug("Diagnostics for %s: %d items", uri, len(diags))
         elif method == "window/logMessage":
             params = msg.get("params", {})

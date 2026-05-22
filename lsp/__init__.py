@@ -141,21 +141,21 @@ class LSPServerManager:
             await server.did_open(path, content, version=1)
             await server.did_save(path)
 
-        # Wait for diagnostics
+        # Event-driven wait for diagnostics (replaces fixed sleep)
         wait_seconds = cfg.wait_seconds if cfg else 5.0
-        logger.info("Waiting %.1fs for %s diagnostics...", wait_seconds, lang)
-        await asyncio.sleep(wait_seconds)
+        logger.info("Waiting up to %.1fs for %s diagnostics...", wait_seconds, lang)
+        diags = await server.wait_for_diagnostics(path, timeout=wait_seconds)
+        logger.info("Received %d diagnostics for %s", len(diags), lang)
 
-        # Language-specific diagnostic fetch
-        diags: List[Dict] = []
-        if handler and hasattr(handler, "get_diagnostics"):
+        # Language-specific diagnostic fetch (fallback for servers that don't push)
+        if not diags and handler and hasattr(handler, "get_diagnostics"):
             diags = await handler.get_diagnostics(server, path)
         if not diags:
-            diags = server.get_diagnostics(path, timeout=10.0)
+            diags = server.get_diagnostics(path, timeout=2.0)
             if not diags:
                 try:
                     pull_diags = await asyncio.wait_for(
-                        server.request_diagnostics(path), timeout=10.0
+                        server.request_diagnostics(path), timeout=5.0
                     )
                     if pull_diags:
                         diags = pull_diags
@@ -195,19 +195,23 @@ class LSPServerManager:
         uri = path.as_uri()
         if uri not in server._open_documents:
             await server.did_open(path, content, version=1)
+
+        # Event-driven wait for diagnostics (replaces fixed sleep)
         wait_seconds = cfg.wait_seconds if cfg else 5.0
-        await asyncio.sleep(wait_seconds)
+        logger.info("Waiting up to %.1fs for baseline diagnostics...", wait_seconds)
+        baseline_diags = await server.wait_for_diagnostics(path, timeout=wait_seconds)
+        logger.info("Received %d baseline diagnostics", len(baseline_diags))
 
-        baseline_diags: List[Dict] = []
-        try:
-            baseline_diags = await asyncio.wait_for(
-                server.request_diagnostics(path), timeout=10.0
-            )
-            logger.info("Baseline pull diagnostics: %d items", len(baseline_diags))
-        except Exception:
-            pass
+        if not baseline_diags:
+            try:
+                baseline_diags = await asyncio.wait_for(
+                    server.request_diagnostics(path), timeout=5.0
+                )
+                logger.info("Baseline pull diagnostics: %d items", len(baseline_diags))
+            except Exception:
+                pass
 
-        push_diags = server.get_diagnostics(path, timeout=2.0)
+        push_diags = server.get_diagnostics(path, timeout=1.0)
         if push_diags and not baseline_diags:
             baseline_diags = push_diags
             logger.info("Using push diagnostics for baseline: %d items", len(baseline_diags))
@@ -236,15 +240,20 @@ class LSPServerManager:
         uri = path.as_uri()
         if uri not in server._open_documents:
             await server.did_open(path, content, version=1)
-        wait_seconds = cfg.wait_seconds if cfg else 5.0
-        await asyncio.sleep(wait_seconds)
 
-        diags = server.get_diagnostics(path, timeout=5.0)
+        # Event-driven wait for diagnostics (replaces fixed sleep)
+        wait_seconds = cfg.wait_seconds if cfg else 5.0
+        logger.info("Waiting up to %.1fs for diagnostics...", wait_seconds)
+        diags = await server.wait_for_diagnostics(path, timeout=wait_seconds)
+        logger.info("Received %d diagnostics", len(diags))
+
+        if not diags:
+            diags = server.get_diagnostics(path, timeout=2.0)
         debug_log(f"[_get_diagnostics] push diags: {len(diags)}")
         if not diags:
             try:
                 pull_diags = await asyncio.wait_for(
-                    server.request_diagnostics(path), timeout=10.0
+                    server.request_diagnostics(path), timeout=5.0
                 )
                 if pull_diags:
                     diags = pull_diags
