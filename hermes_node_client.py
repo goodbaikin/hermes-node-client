@@ -1472,7 +1472,7 @@ async def connect_and_serve(gateway_url: str, token: str, node_id: str, api_serv
     while True:
         try:
             logger.info("[%s] Connecting to %s (%s mode)...", node_id, target_url, mode)
-            async with websockets.connect(auth_url) as ws:
+            async with websockets.connect(auth_url, max_size=10*1024*1024) as ws:
                 delay = RECONNECT_MIN_DELAY  # Reset on successful connect
 
                 # --- Handshake ---

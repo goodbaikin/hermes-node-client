@@ -65,14 +65,14 @@ LSP_REGISTRY: Dict[str, LanguageConfig] = {
     "html": LanguageConfig(
         bin="vscode-html-language-server",
         args=["--stdio"],
-        root_markers=["package.json", ".html"],
+        root_markers=[],
         wait_seconds=3.0,
         handler_module="web",
     ),
     "css": LanguageConfig(
         bin="vscode-css-language-server",
         args=["--stdio"],
-        root_markers=["package.json", ".css"],
+        root_markers=[],
         wait_seconds=3.0,
         handler_module="web",
     ),
