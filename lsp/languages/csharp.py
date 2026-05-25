@@ -27,6 +27,8 @@ class Handler:
         uri = path.as_uri()
         if uri not in server._open_documents:
             await server.did_open(path, content, version=1)
+        # Clear diagnostic event before triggering new analysis
+        server._clear_diag_event(path)
         await server.notify_file_changed(path)
         await server.did_save(path)
 

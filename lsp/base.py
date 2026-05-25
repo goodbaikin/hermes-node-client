@@ -457,7 +457,10 @@ class LSPSubprocess:
                 event = self._diag_events.get(uri)
                 if event is not None:
                     event.set()
-            logger.debug("Diagnostics for %s: %d items", uri, len(diags))
+            # Debug: log all received diagnostic codes
+            codes = [d.get("code", "?") for d in diags]
+            logger.info("publishDiagnostics for %s: %d items, codes=%s", uri, len(diags), codes)
+            debug_log(f"[publishDiagnostics] {uri}: {len(diags)} diags, codes={codes}")
         elif method == "window/logMessage":
             params = msg.get("params", {})
             msg_type = params.get("type", 0)

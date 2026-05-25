@@ -127,6 +127,7 @@ COMMANDS = {
     "terminal.stream",
     "file.read",
     "file.write",
+    "file.patch",
     "file.delete",
     "file.list",
     "search.content",
@@ -391,6 +392,104 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
             f.write(text)
 
     return {"path": str(path), "bytesWritten": path.stat().st_size}
+
+
+class _V4APatchFileOps:
+    """Minimal file-ops adapter used by V4A patch parser/applicator."""
+
+    def __init__(self, base_dir: str = ".") -> None:
+        self.base_dir = Path(base_dir)
+
+    def _resolve_path(self, path: str) -> Path:
+        normalized = str(path)
+        if os.path.isabs(normalized) or (len(normalized) >= 3 and normalized[1] == ":" and normalized[2] in ("\\", "/")):
+            return Path(normalized)
+        return self.base_dir / normalized
+
+    def read_file_raw(self, path: str):
+        from tools.file_operations import ReadResult
+
+        resolved = self._resolve_path(path)
+        if not resolved.exists():
+            return ReadResult(error=f"File not found: {path}")
+
+        if resolved.is_dir():
+            return ReadResult(error=f"Path is a directory: {path}")
+
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = resolved.read_text(encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                try:
+                    text = resolved.read_text(encoding="cp932")
+                except Exception as exc:
+                    return ReadResult(error=f"Failed to read file: {exc}")
+
+        return ReadResult(content=_normalize_crlf(text), total_lines=max(1, len(text.splitlines()) or 1))
+
+    def write_file(self, path: str, content: str):
+        from tools.file_operations import WriteResult
+
+        resolved = self._resolve_path(path)
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            with open(resolved, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            return WriteResult(bytes_written=len(content.encode("utf-8")))
+        except Exception as exc:
+            return WriteResult(error=f"Failed to write file: {exc}")
+
+    def delete_file(self, path: str):
+        from tools.file_operations import WriteResult
+
+        resolved = self._resolve_path(path)
+        try:
+            if resolved.exists():
+                resolved.unlink()
+            return WriteResult(bytes_written=0)
+        except Exception as exc:
+            return WriteResult(error=f"Failed to delete file: {exc}")
+
+    def move_file(self, src_path: str, dst_path: str):
+        from tools.file_operations import WriteResult
+
+        src = self._resolve_path(src_path)
+        dst = self._resolve_path(dst_path)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            return WriteResult(bytes_written=0)
+        except Exception as exc:
+            return WriteResult(error=f"Failed to move file: {exc}")
+
+
+async def handle_file_patch(params: dict[str, Any]) -> dict[str, Any]:
+    """Apply a V4A patch payload locally on the node."""
+    patch = params.get("patch", "")
+    if not isinstance(patch, str):
+        return {"error": "Patch content must be a string"}
+
+    if not patch.strip():
+        return {"error": "Patch content is required"}
+
+    try:
+        from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
+    except Exception as exc:
+        return {"error": f"Failed to load patch parser: {exc}"}
+
+    operations, parse_error = parse_v4a_patch(patch)
+    if parse_error:
+        return {"error": parse_error}
+
+    base_dir = params.get("base_dir", ".")
+    file_ops = _V4APatchFileOps(base_dir=base_dir)
+    try:
+        patch_result = apply_v4a_operations(operations, file_ops)
+        return patch_result.to_dict()
+    except Exception as exc:
+        return {"error": f"Patch apply failed: {exc}"}
 
 
 async def handle_file_delete(params: dict[str, Any]) -> dict[str, Any]:
@@ -1331,6 +1430,7 @@ HANDLERS = {
     "terminal.stream": handle_terminal_stream,
     "file.read": handle_file_read,
     "file.write": handle_file_write,
+    "file.patch": handle_file_patch,
     "file.delete": handle_file_delete,
     "file.list": handle_file_list,
     "search.content": handle_search_content,
