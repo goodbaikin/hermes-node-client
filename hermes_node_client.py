@@ -706,6 +706,56 @@ async def handle_signtool(params: dict[str, Any]) -> dict[str, Any]:
     return await handle_terminal_exec({"cmd": cmd, "timeoutMs": 60000})
 
 
+def _load_lsp_manager_factory():
+    """Import the node-client LSP manager from package or script layouts."""
+    try:
+        from node_client.lsp import get_lsp_manager
+        return get_lsp_manager
+    except ModuleNotFoundError as exc:
+        if exc.name != "node_client":
+            raise
+
+    script_dir = Path(__file__).resolve().parent
+    import_attempts = [
+        (script_dir.parent, "node_client.lsp"),  # repo checkout: <root>/node_client/hermes_node_client.py
+        (script_dir, "lsp"),                    # copied script: hermes_node_client.py next to lsp/
+    ]
+    for sys_path_entry, module_name in import_attempts:
+        entry = str(sys_path_entry)
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+        try:
+            module = __import__(module_name, fromlist=["get_lsp_manager"])
+            return module.get_lsp_manager
+        except ModuleNotFoundError as exc:
+            missing_root = module_name.split(".", 1)[0]
+            if exc.name != missing_root:
+                raise
+
+    # Last resort: load lsp/ as a standalone package.  The package name must not
+    # include "node_client." unless the parent package exists in sys.modules;
+    # otherwise relative imports inside lsp/__init__.py explode with
+    # "No module named node_client".
+    import importlib.util
+    init_path = script_dir / "lsp" / "__init__.py"
+    if not init_path.exists():
+        init_path = script_dir.parent / "node_client" / "lsp" / "__init__.py"
+    if not init_path.exists():
+        raise ModuleNotFoundError("lsp package not found")
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_node_lsp",
+        init_path,
+        submodule_search_locations=[str(init_path.parent)],
+    )
+    if not spec or not spec.loader:
+        raise ModuleNotFoundError("lsp package not found")
+    lsp_mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = lsp_mod
+    spec.loader.exec_module(lsp_mod)
+    return lsp_mod.get_lsp_manager
+
+
 async def handle_lsp(params: dict[str, Any]) -> dict[str, Any]:
     """LSP diagnostics via local language server.
 
@@ -716,31 +766,7 @@ async def handle_lsp(params: dict[str, Any]) -> dict[str, Any]:
         file_path: str
         content: str (optional, for lint_after_write)
     """
-    try:
-        from node_client.lsp import get_lsp_manager
-    except ImportError:
-        # Fallback: try relative import if lsp package is in same dir
-        import importlib.util
-        script_dir = Path(__file__).parent
-        spec = importlib.util.spec_from_file_location(
-            "node_client.lsp", script_dir / "lsp" / "__init__.py"
-        )
-        if spec and spec.loader:
-            lsp_mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(lsp_mod)
-            get_lsp_manager = lsp_mod.get_lsp_manager
-        else:
-            # Second fallback: node_client/ sibling directory
-            spec2 = importlib.util.spec_from_file_location(
-                "node_client.lsp", script_dir.parent / "node_client" / "lsp" / "__init__.py"
-            )
-            if spec2 and spec2.loader:
-                lsp_mod = importlib.util.module_from_spec(spec2)
-                spec2.loader.exec_module(lsp_mod)
-                get_lsp_manager = lsp_mod.get_lsp_manager
-            else:
-                return {"error": "lsp package not found"}
-
+    get_lsp_manager = _load_lsp_manager_factory()
     mgr = get_lsp_manager()
     return await mgr.handle_request(params)
 
