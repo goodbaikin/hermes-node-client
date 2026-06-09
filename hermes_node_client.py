@@ -138,7 +138,7 @@ COMMANDS = {
     "lsp",
 }
 
-DEFAULT_TIMEOUT_SEC = 30
+DEFAULT_TIMEOUT_SEC = 300
 MAX_TIMEOUT_SEC = 600
 
 
@@ -150,9 +150,19 @@ async def handle_terminal_exec(params: dict[str, Any]) -> dict[str, Any]:
     """Execute PowerShell locally. No SSH escaping hell."""
     cmd = params["cmd"]
     cwd = params.get("cwd")
-    timeout_sec = min(
-        params.get("timeoutMs", DEFAULT_TIMEOUT_SEC * 1000) / 1000, MAX_TIMEOUT_SEC
-    )
+    raw_timeout_ms = params.get("timeoutMs")
+    if raw_timeout_ms is None and "timeout" in params:
+        try:
+            raw_timeout_ms = float(params.get("timeout")) * 1000
+        except (TypeError, ValueError):
+            raw_timeout_ms = None
+    if raw_timeout_ms is None:
+        raw_timeout_ms = DEFAULT_TIMEOUT_SEC * 1000
+    try:
+        timeout_ms = float(raw_timeout_ms)
+    except (TypeError, ValueError):
+        timeout_ms = DEFAULT_TIMEOUT_SEC * 1000
+    timeout_sec = min(max(timeout_ms / 1000, 1), MAX_TIMEOUT_SEC)
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
