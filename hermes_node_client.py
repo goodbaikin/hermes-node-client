@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -404,6 +405,20 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
     return {"path": str(path), "bytesWritten": path.stat().st_size}
 
 
+@dataclass
+class _NodeReadResult:
+    content: str = ""
+    total_lines: int = 0
+    error: str | None = None
+
+
+@dataclass
+class _NodeWriteResult:
+    bytes_written: int = 0
+    error: str | None = None
+    lsp_diagnostics: str | None = None
+
+
 class _V4APatchFileOps:
     """Minimal file-ops adapter used by V4A patch parser/applicator."""
 
@@ -417,14 +432,12 @@ class _V4APatchFileOps:
         return self.base_dir / normalized
 
     def read_file_raw(self, path: str):
-        from tools.file_operations import ReadResult
-
         resolved = self._resolve_path(path)
         if not resolved.exists():
-            return ReadResult(error=f"File not found: {path}")
+            return _NodeReadResult(error=f"File not found: {path}")
 
         if resolved.is_dir():
-            return ReadResult(error=f"Path is a directory: {path}")
+            return _NodeReadResult(error=f"Path is a directory: {path}")
 
         try:
             text = resolved.read_text(encoding="utf-8")
@@ -435,44 +448,38 @@ class _V4APatchFileOps:
                 try:
                     text = resolved.read_text(encoding="cp932")
                 except Exception as exc:
-                    return ReadResult(error=f"Failed to read file: {exc}")
+                    return _NodeReadResult(error=f"Failed to read file: {exc}")
 
-        return ReadResult(content=_normalize_crlf(text), total_lines=max(1, len(text.splitlines()) or 1))
+        return _NodeReadResult(content=_normalize_crlf(text), total_lines=max(1, len(text.splitlines()) or 1))
 
     def write_file(self, path: str, content: str):
-        from tools.file_operations import WriteResult
-
         resolved = self._resolve_path(path)
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             with open(resolved, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
-            return WriteResult(bytes_written=len(content.encode("utf-8")))
+            return _NodeWriteResult(bytes_written=len(content.encode("utf-8")))
         except Exception as exc:
-            return WriteResult(error=f"Failed to write file: {exc}")
+            return _NodeWriteResult(error=f"Failed to write file: {exc}")
 
     def delete_file(self, path: str):
-        from tools.file_operations import WriteResult
-
         resolved = self._resolve_path(path)
         try:
             if resolved.exists():
                 resolved.unlink()
-            return WriteResult(bytes_written=0)
+            return _NodeWriteResult(bytes_written=0)
         except Exception as exc:
-            return WriteResult(error=f"Failed to delete file: {exc}")
+            return _NodeWriteResult(error=f"Failed to delete file: {exc}")
 
     def move_file(self, src_path: str, dst_path: str):
-        from tools.file_operations import WriteResult
-
         src = self._resolve_path(src_path)
         dst = self._resolve_path(dst_path)
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.replace(dst)
-            return WriteResult(bytes_written=0)
+            return _NodeWriteResult(bytes_written=0)
         except Exception as exc:
-            return WriteResult(error=f"Failed to move file: {exc}")
+            return _NodeWriteResult(error=f"Failed to move file: {exc}")
 
 
 async def handle_file_patch(params: dict[str, Any]) -> dict[str, Any]:
@@ -485,7 +492,10 @@ async def handle_file_patch(params: dict[str, Any]) -> dict[str, Any]:
         return {"error": "Patch content is required"}
 
     try:
-        from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
+        try:
+            from .patch_parser import parse_v4a_patch, apply_v4a_operations
+        except ImportError:
+            from patch_parser import parse_v4a_patch, apply_v4a_operations
     except Exception as exc:
         return {"error": f"Failed to load patch parser: {exc}"}
 
