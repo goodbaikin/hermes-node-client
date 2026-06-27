@@ -135,6 +135,8 @@ RECONNECT_MIN_DELAY = 1.0
 RECONNECT_MAX_DELAY = 60.0
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
 DEFAULT_BROWSER_DEBUG_PORT = 9222
+DEFAULT_BROWSER_EXPOSED_PORT = 9224
+DEFAULT_BROWSER_RELAY_RULE_PREFIX = "Hermes CDP Relay"
 
 BASE_COMMANDS = {
     "terminal.exec",
@@ -405,7 +407,120 @@ def _read_browser_debug_payload(host: str, port: int) -> dict[str, Any]:
     return payload
 
 
-def _browser_debug_status_payload(port: int, discovery_host: str = "127.0.0.1", public_host: Optional[str] = None) -> dict[str, Any]:
+def _relay_rule_name(exposed_port: int) -> str:
+    return f"{DEFAULT_BROWSER_RELAY_RULE_PREFIX} {exposed_port}"
+
+
+def _netsh_run(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+
+
+def _relay_http_ready(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/json/version", timeout=2.0) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _ensure_windows_browser_relay(
+    discovery_port: int,
+    exposed_port: int,
+    public_host: str,
+    ensure_firewall: bool = True,
+) -> dict[str, Any]:
+    relay = {
+        "supported": sys.platform == "win32",
+        "configured": False,
+        "reachable": False,
+        "listen_port": exposed_port,
+        "connect_port": discovery_port,
+        "listen_address": "0.0.0.0",
+        "connect_address": "127.0.0.1",
+        "rule_name": _relay_rule_name(exposed_port),
+        "public_host": public_host,
+        "errors": [],
+    }
+    if sys.platform != "win32":
+        return relay
+
+    if _relay_http_ready("127.0.0.1", exposed_port):
+        relay["configured"] = True
+        if ensure_firewall:
+            try:
+                fw_proc = _netsh_run([
+                    "netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={relay['rule_name']}",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=TCP",
+                    f"localport={exposed_port}",
+                ])
+                if fw_proc.returncode != 0:
+                    msg = fw_proc.stderr.strip() or fw_proc.stdout.strip()
+                    if "exists" not in msg.lower():
+                        relay["errors"].append(msg or "Failed to add firewall rule")
+            except Exception as exc:
+                relay["errors"].append(str(exc))
+        relay["reachable"] = bool(public_host) and _relay_http_ready(public_host, exposed_port)
+        return relay
+
+    try:
+        delete_proc = _netsh_run([
+            "netsh", "interface", "portproxy", "delete", "v4tov4",
+            f"listenport={exposed_port}",
+            "listenaddress=0.0.0.0",
+        ])
+        if delete_proc.returncode not in (0, 1):
+            relay["errors"].append(delete_proc.stderr.strip() or delete_proc.stdout.strip())
+
+        add_proc = _netsh_run([
+            "netsh", "interface", "portproxy", "add", "v4tov4",
+            f"listenport={exposed_port}",
+            "listenaddress=0.0.0.0",
+            f"connectport={discovery_port}",
+            "connectaddress=127.0.0.1",
+        ])
+        if add_proc.returncode != 0:
+            relay["errors"].append(add_proc.stderr.strip() or add_proc.stdout.strip() or "Failed to add portproxy rule")
+        else:
+            relay["configured"] = True
+
+        if ensure_firewall:
+            fw_proc = _netsh_run([
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={relay['rule_name']}",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                f"localport={exposed_port}",
+            ])
+            if fw_proc.returncode != 0:
+                msg = fw_proc.stderr.strip() or fw_proc.stdout.strip()
+                if "exists" not in msg.lower():
+                    relay["errors"].append(msg or "Failed to add firewall rule")
+    except Exception as exc:
+        relay["errors"].append(str(exc))
+
+    relay["configured"] = relay["configured"] or _relay_http_ready("127.0.0.1", exposed_port)
+    relay["reachable"] = bool(public_host) and _relay_http_ready(public_host, exposed_port)
+    return relay
+
+
+def _browser_debug_status_payload(
+    port: int,
+    discovery_host: str = "127.0.0.1",
+    public_host: Optional[str] = None,
+    exposed_port: Optional[int] = None,
+    ensure_exposed: bool = False,
+) -> dict[str, Any]:
     try:
         payload = _read_browser_debug_payload(discovery_host, port)
     except Exception as exc:
@@ -420,7 +535,32 @@ def _browser_debug_status_payload(port: int, discovery_host: str = "127.0.0.1", 
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "")
     remote_host = public_host or _guess_public_host()
+    relay_info = None
     suggested = _rewrite_ws_host(ws_url, remote_host) if ws_url and remote_host else ws_url
+
+    if sys.platform == "win32" and remote_host and discovery_host in {"127.0.0.1", "localhost"}:
+        relay_port = int(exposed_port or DEFAULT_BROWSER_EXPOSED_PORT)
+        if ensure_exposed:
+            relay_info = _ensure_windows_browser_relay(port, relay_port, remote_host)
+        else:
+            relay_info = {
+                "supported": True,
+                "configured": _relay_http_ready("127.0.0.1", relay_port),
+                "reachable": _relay_http_ready(remote_host, relay_port),
+                "listen_port": relay_port,
+                "connect_port": port,
+                "listen_address": "0.0.0.0",
+                "connect_address": "127.0.0.1",
+                "rule_name": _relay_rule_name(relay_port),
+                "public_host": remote_host,
+                "errors": [],
+            }
+        if relay_info.get("configured") and relay_info.get("reachable"):
+            suggested = _rewrite_ws_host(ws_url, f"{remote_host}:{relay_info['listen_port']}")
+            if ws_url:
+                parsed = urllib.parse.urlparse(ws_url)
+                suggested = parsed._replace(netloc=f"{remote_host}:{relay_info['listen_port']}").geturl()
+
     return {
         "listening": True,
         "host": discovery_host,
@@ -433,6 +573,7 @@ def _browser_debug_status_payload(port: int, discovery_host: str = "127.0.0.1", 
         "websocket_debugger_url": ws_url,
         "suggested_connect_url": suggested,
         "public_host": remote_host,
+        "relay": relay_info,
     }
 
 
@@ -441,7 +582,15 @@ async def handle_browser_debug_status(params: dict[str, Any]) -> dict[str, Any]:
     port = int(params.get("port") or DEFAULT_BROWSER_DEBUG_PORT)
     discovery_host = str(params.get("host") or "127.0.0.1")
     public_host = str(params.get("public_host") or "").strip() or None
-    return _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+    exposed_port = int(params.get("exposed_port") or DEFAULT_BROWSER_EXPOSED_PORT)
+    ensure_exposed = bool(params.get("ensure_exposed", True))
+    return _browser_debug_status_payload(
+        port=port,
+        discovery_host=discovery_host,
+        public_host=public_host,
+        exposed_port=exposed_port,
+        ensure_exposed=ensure_exposed,
+    )
 
 
 async def handle_browser_debug_launch(params: dict[str, Any]) -> dict[str, Any]:
@@ -450,13 +599,21 @@ async def handle_browser_debug_launch(params: dict[str, Any]) -> dict[str, Any]:
     port = int(params.get("port") or DEFAULT_BROWSER_DEBUG_PORT)
     discovery_host = str(params.get("host") or "127.0.0.1")
     public_host = str(params.get("public_host") or "").strip() or None
+    exposed_port = int(params.get("exposed_port") or DEFAULT_BROWSER_EXPOSED_PORT)
+    ensure_exposed = bool(params.get("ensure_exposed", True))
     user_data_dir = str(params.get("user_data_dir") or "").strip()
     profile_directory = str(params.get("profile_directory") or "").strip()
     extra_args = params.get("extra_args") or []
     if not isinstance(extra_args, list):
         raise ValueError("extra_args must be a list of strings")
 
-    existing = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+    existing = _browser_debug_status_payload(
+        port=port,
+        discovery_host=discovery_host,
+        public_host=public_host,
+        exposed_port=exposed_port,
+        ensure_exposed=ensure_exposed,
+    )
     if existing.get("listening"):
         existing.update({"launched": False, "already_listening": True})
         return existing
@@ -489,12 +646,24 @@ async def handle_browser_debug_launch(params: dict[str, Any]) -> dict[str, Any]:
 
     for _ in range(20):
         await asyncio.sleep(0.5)
-        status = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+        status = _browser_debug_status_payload(
+            port=port,
+            discovery_host=discovery_host,
+            public_host=public_host,
+            exposed_port=exposed_port,
+            ensure_exposed=ensure_exposed,
+        )
         if status.get("listening"):
             status.update({"launched": True, "already_listening": False, "argv": argv})
             return status
 
-    status = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+    status = _browser_debug_status_payload(
+        port=port,
+        discovery_host=discovery_host,
+        public_host=public_host,
+        exposed_port=exposed_port,
+        ensure_exposed=ensure_exposed,
+    )
     status.update({
         "launched": True,
         "already_listening": False,
