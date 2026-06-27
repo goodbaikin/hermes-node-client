@@ -74,7 +74,7 @@ def _load_dotenv():
     if not env_file.exists():
         return
     try:
-        with open(env_file, "r", encoding="utf-8") as f:
+        with open(env_file, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
