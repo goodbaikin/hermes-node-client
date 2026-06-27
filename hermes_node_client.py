@@ -33,17 +33,22 @@ Security:
 
 import asyncio
 import base64
+import importlib
 import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 # Fix Windows console encoding to UTF-8 before any I/O happens
 if sys.platform == "win32":
@@ -122,8 +127,9 @@ NODE_TOKEN = os.environ.get("HERMES_NODE_TOKEN", "dev-token-change-me")
 RECONNECT_MIN_DELAY = 1.0
 RECONNECT_MAX_DELAY = 60.0
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_BROWSER_DEBUG_PORT = 9222
 
-COMMANDS = {
+BASE_COMMANDS = {
     "terminal.exec",
     "terminal.stream",
     "file.read",
@@ -137,6 +143,15 @@ COMMANDS = {
     "signtool",
     "node.restart",
     "lsp",
+}
+BROWSER_COMMANDS = {
+    "browser.debug_status",
+    "browser.debug_launch",
+}
+COMMANDS = set(BASE_COMMANDS) | set(BROWSER_COMMANDS)
+NODE_METADATA = {
+    "browser_scope": "full_browser",
+    "computer_use_enabled": False,
 }
 
 DEFAULT_TIMEOUT_SEC = 300
@@ -275,6 +290,215 @@ def _resolve_command(name: str) -> str:
     """
     resolved = shutil.which(name)
     return resolved if resolved else name
+
+
+def _guess_public_host() -> str:
+    """Best-effort LAN/Tailscale-reachable host for browser CDP handoff."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            host = sock.getsockname()[0]
+            if host:
+                return host
+    except OSError:
+        pass
+    try:
+        host = socket.gethostbyname(socket.gethostname())
+        if host:
+            return host
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def _browser_command_groups() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    if sys.platform == "win32":
+        return {
+            "chrome": (("chrome.exe",), (
+                os.path.join(os.environ.get("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            )),
+            "edge": (("msedge.exe",), (
+                os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            )),
+            "brave": (("brave.exe", "brave-browser.exe"), (
+                os.path.join(os.environ.get("ProgramFiles", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            )),
+            "chromium": (("chromium.exe", "chromium-browser.exe"), (
+                os.path.join(os.environ.get("ProgramFiles", ""), "Chromium", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Chromium", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Chromium", "Application", "chrome.exe"),
+            )),
+        }
+    if sys.platform == "darwin":
+        return {
+            "chrome": (("Google Chrome",), ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",)),
+            "edge": (("Microsoft Edge",), ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",)),
+            "brave": (("Brave Browser",), ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",)),
+            "chromium": (("Chromium",), ("/Applications/Chromium.app/Contents/MacOS/Chromium",)),
+        }
+    return {
+        "chrome": (("google-chrome", "google-chrome-stable"), ("/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/opt/google/chrome/chrome")),
+        "edge": (("microsoft-edge", "microsoft-edge-stable", "msedge"), ("/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable", "/opt/microsoft/msedge/msedge", "/opt/microsoft/msedge/microsoft-edge")),
+        "brave": (("brave-browser", "brave-browser-stable", "brave"), ("/usr/bin/brave-browser", "/usr/bin/brave-browser-stable", "/usr/bin/brave", "/snap/bin/brave")),
+        "chromium": (("chromium", "chromium-browser"), ("/usr/bin/chromium", "/usr/bin/chromium-browser")),
+    }
+
+
+def _find_browser_executable(browser: str) -> Optional[str]:
+    groups = _browser_command_groups()
+    ordered = [browser] if browser in groups else ["chrome", "edge", "brave", "chromium"]
+    seen: set[str] = set()
+    for key in ordered:
+        names, paths = groups.get(key, ((), ()))
+        for name in names:
+            candidate = shutil.which(name)
+            if candidate and candidate not in seen:
+                return candidate
+            seen.add(candidate or name)
+        for path in paths:
+            if path and os.path.isfile(path) and path not in seen:
+                return path
+            seen.add(path)
+    return None
+
+
+def _browser_detach_kwargs() -> dict[str, Any]:
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True}
+
+
+def _rewrite_ws_host(ws_url: str, host: str) -> str:
+    parsed = urllib.parse.urlparse(ws_url)
+    if not parsed.scheme or not parsed.netloc or not host:
+        return ws_url
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    return parsed._replace(netloc=f"{host}:{port}").geturl()
+
+
+def _read_browser_debug_payload(host: str, port: int) -> dict[str, Any]:
+    version_url = f"http://{host}:{port}/json/version"
+    json_url = f"http://{host}:{port}/json"
+    with urllib.request.urlopen(version_url, timeout=2.0) as response:
+        payload = json.load(response)
+    try:
+        with urllib.request.urlopen(json_url, timeout=2.0) as response:
+            targets = json.load(response)
+    except Exception:
+        targets = []
+    if not isinstance(targets, list):
+        targets = []
+    payload["_target_count"] = len(targets)
+    return payload
+
+
+def _browser_debug_status_payload(port: int, discovery_host: str = "127.0.0.1", public_host: Optional[str] = None) -> dict[str, Any]:
+    try:
+        payload = _read_browser_debug_payload(discovery_host, port)
+    except Exception as exc:
+        return {
+            "listening": False,
+            "host": discovery_host,
+            "port": port,
+            "discovery_url": f"http://{discovery_host}:{port}",
+            "suggested_connect_url": "",
+            "error": str(exc),
+        }
+
+    ws_url = str(payload.get("webSocketDebuggerUrl") or "")
+    remote_host = public_host or _guess_public_host()
+    suggested = _rewrite_ws_host(ws_url, remote_host) if ws_url and remote_host else ws_url
+    return {
+        "listening": True,
+        "host": discovery_host,
+        "port": port,
+        "browser": payload.get("Browser", ""),
+        "protocol_version": payload.get("Protocol-Version", ""),
+        "user_agent": payload.get("User-Agent", ""),
+        "target_count": payload.get("_target_count", 0),
+        "discovery_url": f"http://{discovery_host}:{port}",
+        "websocket_debugger_url": ws_url,
+        "suggested_connect_url": suggested,
+        "public_host": remote_host,
+    }
+
+
+async def handle_browser_debug_status(params: dict[str, Any]) -> dict[str, Any]:
+    """Return the current browser CDP endpoint information on this node."""
+    port = int(params.get("port") or DEFAULT_BROWSER_DEBUG_PORT)
+    discovery_host = str(params.get("host") or "127.0.0.1")
+    public_host = str(params.get("public_host") or "").strip() or None
+    return _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+
+
+async def handle_browser_debug_launch(params: dict[str, Any]) -> dict[str, Any]:
+    """Launch a Chromium-family browser with remote debugging enabled."""
+    browser = str(params.get("browser") or "auto").strip().lower() or "auto"
+    port = int(params.get("port") or DEFAULT_BROWSER_DEBUG_PORT)
+    discovery_host = str(params.get("host") or "127.0.0.1")
+    public_host = str(params.get("public_host") or "").strip() or None
+    user_data_dir = str(params.get("user_data_dir") or "").strip()
+    profile_directory = str(params.get("profile_directory") or "").strip()
+    extra_args = params.get("extra_args") or []
+    if not isinstance(extra_args, list):
+        raise ValueError("extra_args must be a list of strings")
+
+    existing = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+    if existing.get("listening"):
+        existing.update({"launched": False, "already_listening": True})
+        return existing
+
+    executable = _find_browser_executable(browser)
+    if not executable:
+        raise FileNotFoundError(
+            f"No Chromium-family browser executable found for '{browser}'. "
+            "Install Chrome/Edge/Brave/Chromium or pass a supported browser name."
+        )
+
+    argv = [
+        executable,
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if user_data_dir:
+        argv.append(f"--user-data-dir={user_data_dir}")
+    if profile_directory:
+        argv.append(f"--profile-directory={profile_directory}")
+    argv.extend(str(arg) for arg in extra_args)
+
+    subprocess.Popen(
+        argv,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **_browser_detach_kwargs(),
+    )
+
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        status = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+        if status.get("listening"):
+            status.update({"launched": True, "already_listening": False, "argv": argv})
+            return status
+
+    status = _browser_debug_status_payload(port=port, discovery_host=discovery_host, public_host=public_host)
+    status.update({
+        "launched": True,
+        "already_listening": False,
+        "argv": argv,
+        "hint": (
+            "Browser process started but the debug endpoint is still unreachable. "
+            "If your normal browser is already running, fully close it and retry, "
+            "or launch with a separate user_data_dir."
+        ),
+    })
+    return status
 
 
 def _pid_exists(pid: int) -> bool:
@@ -1485,7 +1709,70 @@ HANDLERS = {
     "signtool": handle_signtool,
     "node.restart": handle_node_restart,
     "lsp": handle_lsp,
+    "browser.debug_status": handle_browser_debug_status,
+    "browser.debug_launch": handle_browser_debug_launch,
 }
+
+
+def _load_optional_computer_use_handler() -> tuple[Optional[Callable[..., Any]], Optional[str]]:
+    errors: list[str] = []
+    if __package__:
+        try:
+            mod = importlib.import_module(".computer_use_handler", package=__package__)
+            handler = getattr(mod, "handle_computer_use", None)
+            if handler is not None:
+                return handler, None
+            errors.append(f"{__package__}.computer_use_handler missing handle_computer_use")
+        except Exception as exc:
+            errors.append(f"{__package__}.computer_use_handler: {exc}")
+    try:
+        mod = importlib.import_module("computer_use_handler")
+        handler = getattr(mod, "handle_computer_use", None)
+        if handler is not None:
+            return handler, None
+        errors.append("computer_use_handler missing handle_computer_use")
+    except Exception as exc:
+        errors.append(f"computer_use_handler: {exc}")
+    return None, "; ".join(errors) if errors else "computer_use_handler unavailable"
+
+
+def _caps_for_commands(commands: set[str]) -> list[str]:
+    caps: set[str] = set()
+    if any(cmd.startswith("terminal.") for cmd in commands):
+        caps.add("terminal")
+    if any(cmd.startswith("file.") or cmd.startswith("search.") for cmd in commands):
+        caps.add("file")
+    if any(cmd in {"msbuild", "signtool"} for cmd in commands):
+        caps.add("build")
+    if any(cmd.startswith("browser.") for cmd in commands):
+        caps.add("browser")
+    if "computer.use" in commands:
+        caps.add("computer_use")
+    if "lsp" in commands:
+        caps.add("lsp")
+    return sorted(caps)
+
+
+def configure_runtime_features(allow_computer_use: bool) -> None:
+    global COMMANDS, NODE_METADATA
+    COMMANDS = set(BASE_COMMANDS) | set(BROWSER_COMMANDS)
+    NODE_METADATA = {
+        "browser_scope": "full_browser",
+        "computer_use_enabled": False,
+    }
+    HANDLERS.pop("computer.use", None)
+
+    if not allow_computer_use:
+        return
+
+    handler, error = _load_optional_computer_use_handler()
+    if handler is None:
+        logger.warning("[%s] --allow-computer-use requested but computer_use_handler is unavailable: %s", NODE_ID, error)
+        return
+
+    HANDLERS["computer.use"] = handler
+    COMMANDS.add("computer.use")
+    NODE_METADATA["computer_use_enabled"] = True
 
 
 async def handle_invoke(ws: websockets.WebSocketClientProtocol, payload: dict[str, Any]) -> None:
@@ -1495,6 +1782,8 @@ async def handle_invoke(ws: websockets.WebSocketClientProtocol, payload: dict[st
 
     logger.info("[%s] Invoking %s", NODE_ID, command)
     try:
+        if command not in COMMANDS:
+            raise ValueError(f"Command not enabled for this node: {command}")
         handler = HANDLERS.get(command)
         if not handler:
             raise ValueError(f"Unknown command: {command}")
@@ -1562,8 +1851,9 @@ async def _send_connect_message(ws, node_id: str, token: str) -> bool:
             },
             "role": "node",
             "scopes": [],
-            "caps": ["terminal", "file", "build"],
+            "caps": _caps_for_commands(COMMANDS),
             "commands": sorted(COMMANDS),
+            "metadata": NODE_METADATA,
             "auth": {"token": token},
         }
     }
@@ -1642,14 +1932,25 @@ async def connect_and_serve(gateway_url: str, token: str, node_id: str, api_serv
         delay = min(delay * RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY)
 
 
-def main() -> None:
+def build_arg_parser():
     import argparse
     parser = argparse.ArgumentParser(description="Hermes Remote Node Client")
     parser.add_argument("--gateway", default=GATEWAY_URL, help="Deprecated: kept for compatibility, ignored")
     parser.add_argument("--api-server", default=API_SERVER_URL, help="API Server WebSocket URL (default: ws://localhost:8642/ws)")
     parser.add_argument("--token", default=NODE_TOKEN, help="Node authentication token")
     parser.add_argument("--node-id", default=NODE_ID, help="Unique node identifier")
+    parser.add_argument(
+        "--allow-computer-use",
+        action="store_true",
+        help="Enable the optional computer.use command if a local computer_use_handler is installed",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
     args = parser.parse_args()
+    configure_runtime_features(args.allow_computer_use)
 
     # Always use API Server URL
     api_server_url = args.api_server if args.api_server else args.gateway
