@@ -82,12 +82,19 @@ def _load_dotenv():
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
+                if key:
                     os.environ[key] = value
     except Exception:
         pass
 
 _load_dotenv()
+
+
+def _default_node_id() -> str:
+    host = (socket.gethostname() or "").strip()
+    if not host:
+        return "node-local"
+    return host.split(".", 1)[0]
 
 # ---------------------------------------------------------------------------
 # Logging setup (Windows Event Log friendly)
@@ -119,7 +126,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration (override via env vars or CLI)
 # ---------------------------------------------------------------------------
-NODE_ID = os.environ.get("HERMES_NODE_ID", "dev-win01")
+NODE_ID = os.environ.get("HERMES_NODE_ID", _default_node_id())
 GATEWAY_URL = os.environ.get("HERMES_GATEWAY_URL", "ws://localhost:8642/ws")
 API_SERVER_URL = os.environ.get("HERMES_API_SERVER_URL", "")
 NODE_TOKEN = os.environ.get("HERMES_NODE_TOKEN", "dev-token-change-me")
