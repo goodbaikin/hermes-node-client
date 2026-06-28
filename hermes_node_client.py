@@ -1357,18 +1357,19 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
             env["PYTHONIOENCODING"] = "utf-8"
             env["TERM"] = "xterm-256color"
             env["STTY"] = "echo icanon isig icrnl onlcr opost"
-            # Create empty inputrc to disable readline custom bindings that may reset termios
-            env["INPUTRC"] = "/dev/null"
 
-            # Use asyncio subprocess with PTY (avoids fork issues in event loop)
-            # --norc = don't read .bashrc, -i = interactive; INPUTRC=/dev/null prevents readline from resetting termios
+            # Start a normal interactive shell.  Bash reads ~/.bashrc in this
+            # mode; forcing --norc here made Linux node terminals miss the
+            # user's PATH/tool bootstrap even though Windows PowerShell nodes
+            # behaved normally.
             proc = await asyncio.create_subprocess_exec(
-                shell, "--norc", "-i",
+                shell, "-i",
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
                 pass_fds=[slave_fd],
                 env=env,
+                cwd=initial_cwd,
                 start_new_session=True,
             )
 
@@ -1464,6 +1465,7 @@ async def _terminal_open(proxy_id: str, params: dict[str, Any]) -> dict[str, Any
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=initial_cwd,
         )
     except Exception as e:
         logger.exception("[%s] Failed to start terminal", NODE_ID)
@@ -1680,43 +1682,20 @@ async def _read_terminal_output_pty(
     proc: asyncio.subprocess.Process,
 ) -> None:
     """Background task: read PTY master_fd output and send to gateway."""
-    loop = asyncio.get_event_loop()
     logger.info("[%s] PTY reader started for proxy_id=%s master_fd=%d", NODE_ID, proxy_id, master_fd)
-    check_count = 0
+    os.set_blocking(master_fd, False)
     try:
         while True:
             try:
-                # Check if process has exited
-                if proc.returncode is not None:
-                    logger.info("[%s] PTY reader: process exited, breaking", NODE_ID)
-                    break
-                # Read from master_fd with timeout to avoid blocking forever
-                data = await asyncio.wait_for(
-                    loop.run_in_executor(None, os.read, master_fd, 4096),
-                    timeout=0.5,
-                )
+                # Drain any bytes already buffered on the PTY before looking at
+                # process.returncode.  Fast commands can print output and exit
+                # between loop iterations; checking returncode first drops that
+                # final chunk and makes the Web UI terminal look flaky.
+                data = os.read(master_fd, 4096)
                 if not data:
                     logger.info("[%s] PTY reader: EOF", NODE_ID)
                     break
                 logger.info("[%s] PTY reader: read %d bytes", NODE_ID, len(data))
-                # Periodically re-apply termios settings (bash/readline may reset them)
-                check_count += 1
-                if check_count % 2 == 0:  # Check every 2 reads (was 10)
-                    try:
-                        pts_name = os.ptsname(master_fd)
-                        pts_fd = os.open(pts_name, os.O_RDWR | os.O_NOCTTY)
-                        try:
-                            attrs = termios.tcgetattr(pts_fd)
-                            if not (attrs[3] & termios.ECHO):
-                                attrs[3] |= termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
-                                attrs[0] |= termios.ICRNL
-                                attrs[1] |= termios.OPOST | termios.ONLCR
-                                termios.tcsetattr(pts_fd, termios.TCSANOW, attrs)
-                                logger.info("[%s] PTY watchdog: re-enabled echo on %s", NODE_ID, pts_name)
-                        finally:
-                            os.close(pts_fd)
-                    except Exception:
-                        pass
                 try:
                     session = TERMINAL_SESSIONS.get(proxy_id)
                     if session:
@@ -1733,8 +1712,15 @@ async def _read_terminal_output_pty(
                 except Exception as exc:
                     logger.warning("[%s] Terminal output send failed: %s", NODE_ID, exc)
                     break
-            except asyncio.TimeoutError:
-                # No output available, loop back and check process status
+            except BlockingIOError:
+                # No output available.  Do not use run_in_executor(os.read)
+                # with wait_for here: cancelling that future leaves the worker
+                # thread blocked in os.read, leaking threads while an idle
+                # terminal sits open.
+                if proc.returncode is not None:
+                    logger.info("[%s] PTY reader: process exited and PTY drained, breaking", NODE_ID)
+                    break
+                await asyncio.sleep(0.05)
                 continue
             except OSError as exc:
                 logger.warning("[%s] PTY reader OSError: %s", NODE_ID, exc)
