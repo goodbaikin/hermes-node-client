@@ -41,6 +41,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -738,6 +739,28 @@ def _pid_exists(pid: int) -> bool:
             return False
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> bool:
+    """Atomically replace *path* with *data* and return whether mkdir ran."""
+    parent = path.parent
+    dirs_created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    old_mode = path.stat().st_mode if path.exists() else None
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.hermes-", dir=parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if old_mode is not None:
+            os.chmod(temp_path, old_mode)
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return dirs_created
+
+
 async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
     """Read a file locally. Supports binary (base64) or text (UTF-8).
     
@@ -758,7 +781,9 @@ async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
         return {"error": f"File not found: {path}"}
 
     if encoding:
-        text = path.read_text(encoding=encoding)
+        with open(path, "r", encoding=encoding, newline="") as handle:
+            text = handle.read()
+        line_ending = "crlf" if "\r\n" in text else "lf"
         # Normalize CRLF to LF for consistent cross-platform handling
         if "\r\n" in text:
             text = text.replace("\r\n", "\n")
@@ -773,6 +798,8 @@ async def handle_file_read(params: dict[str, Any]) -> dict[str, Any]:
             "offset": offset,
             "limit": limit,
             "total_lines": total_lines,
+            "fileSize": path.stat().st_size,
+            "lineEnding": line_ending,
         }
     else:
         with open(path, "rb") as f:
@@ -786,7 +813,7 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
     encoding = params.get("encoding", "utf-8-sig")  # BOM-aware UTF-8
     newline = params.get("newline", "\r\n")  # Windows default
 
-    if content_b64:
+    if "content" in params and content_b64 is not None:
         # Fix base64 padding if necessary
         padding_needed = 4 - len(content_b64) % 4
         if padding_needed != 4:
@@ -795,14 +822,18 @@ async def handle_file_write(params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(content_b64, str):
             content_b64 = content_b64.encode('ascii')
         raw = base64.b64decode(content_b64)
-        with open(path, "wb") as f:
-            f.write(raw)
+        dirs_created = _atomic_write_bytes(path, raw)
     else:
         text = params.get("text", "")
-        with open(path, "w", encoding=encoding, newline=newline) as f:
-            f.write(text)
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        raw = normalized.replace("\n", newline).encode(encoding)
+        dirs_created = _atomic_write_bytes(path, raw)
 
-    return {"path": str(path), "bytesWritten": path.stat().st_size}
+    return {
+        "path": str(path),
+        "bytesWritten": path.stat().st_size,
+        "dirsCreated": dirs_created,
+    }
 
 
 @dataclass
@@ -855,9 +886,7 @@ class _V4APatchFileOps:
     def write_file(self, path: str, content: str):
         resolved = self._resolve_path(path)
         try:
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            with open(resolved, "w", encoding="utf-8", newline="\n") as f:
-                f.write(content)
+            _atomic_write_bytes(resolved, content.encode("utf-8"))
             return _NodeWriteResult(bytes_written=len(content.encode("utf-8")))
         except Exception as exc:
             return _NodeWriteResult(error=f"Failed to write file: {exc}")
