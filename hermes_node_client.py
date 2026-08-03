@@ -741,11 +741,12 @@ def _pid_exists(pid: int) -> bool:
 
 def _atomic_write_bytes(path: Path, data: bytes) -> bool:
     """Atomically replace *path* with *data* and return whether mkdir ran."""
-    parent = path.parent
+    target = path.resolve(strict=False) if path.is_symlink() else path
+    parent = target.parent
     dirs_created = not parent.exists()
     parent.mkdir(parents=True, exist_ok=True)
-    old_mode = path.stat().st_mode if path.exists() else None
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.hermes-", dir=parent)
+    old_mode = target.stat().st_mode if target.exists() else None
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.hermes-", dir=parent)
     temp_path = Path(temp_name)
     try:
         with os.fdopen(fd, "wb") as handle:
@@ -754,7 +755,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> bool:
             os.fsync(handle.fileno())
         if old_mode is not None:
             os.chmod(temp_path, old_mode)
-        os.replace(temp_path, path)
+        os.replace(temp_path, target)
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise

@@ -6,15 +6,16 @@ Implements a multi-strategy matching chain to robustly find and replace text,
 accommodating variations in whitespace, indentation, and escaping common
 in LLM-generated code.
 
-The 8-strategy chain (inspired by OpenCode), tried in order:
+The 9-strategy chain (inspired by OpenCode), tried in order:
 1. Exact match - Direct string comparison
 2. Line-trimmed - Strip leading/trailing whitespace per line
 3. Whitespace normalized - Collapse multiple spaces/tabs to single space
 4. Indentation flexible - Ignore indentation differences entirely
 5. Escape normalized - Convert \\n literals to actual newlines
 6. Trimmed boundary - Trim first/last line whitespace only
-7. Block anchor - Match first+last lines, use similarity for middle
-8. Context-aware - 50% line similarity threshold
+7. Unicode normalized - Normalize Unicode punctuation and spaces
+8. Block anchor - Match first+last lines, use similarity for middle
+9. Context-aware - anchored line-by-line similarity
 
 Multi-occurrence matching is handled via the replace_all flag.
 
@@ -82,6 +83,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         ("context_aware", _strategy_context_aware),
     ]
 
+    _SIMILARITY_STRATEGIES = {"block_anchor", "context_aware"}
+
     for strategy_name, strategy_fn in strategies:
         matches = strategy_fn(content, old_string)
 
@@ -91,6 +94,13 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                 return content, 0, None, (
                     f"Found {len(matches)} matches for old_string. "
                     f"Provide more context to make it unique, or use replace_all=True."
+                )
+
+            if replace_all and len(matches) > 1 and strategy_name in _SIMILARITY_STRATEGIES:
+                return content, 0, None, (
+                    f"Found {len(matches)} approximate matches via the "
+                    f"'{strategy_name}' strategy; replace_all only applies to exact "
+                    "matches. Provide the precise text so an exact match can be made."
                 )
 
             # Escape-drift guard: when the matched strategy is NOT `exact`,
@@ -610,36 +620,52 @@ def _strategy_block_anchor(content: str, pattern: str) -> List[Tuple[int, int]]:
 
 def _strategy_context_aware(content: str, pattern: str) -> List[Tuple[int, int]]:
     """
-    Strategy 9: Line-by-line similarity with 50% threshold.
-    
-    Finds blocks where at least 50% of lines have high similarity.
+    Strategy 9: anchored line-by-line similarity.
+
+    Require every non-blank line to match closely. The first/last-line gate
+    avoids scoring every full window and prevents half-matching blocks from
+    replacing unrelated content.
     """
     pattern_lines = pattern.split('\n')
     content_lines = content.split('\n')
-    
+
     if not pattern_lines:
         return []
-    
-    matches = []
+
     pattern_line_count = len(pattern_lines)
-    
+    if pattern_line_count > len(content_lines):
+        return []
+
+    first_pattern = pattern_lines[0].strip()
+    last_pattern = pattern_lines[-1].strip()
+
+    def _similarity(left: str, right: str) -> float:
+        if left == right:
+            return 1.0
+        return SequenceMatcher(None, left, right).ratio()
+
+    matches = []
     for i in range(len(content_lines) - pattern_line_count + 1):
         block_lines = content_lines[i:i + pattern_line_count]
-        
-        # Calculate line-by-line similarity
-        high_similarity_count = 0
+
+        if _similarity(first_pattern, block_lines[0].strip()) < 0.80:
+            continue
+        if _similarity(last_pattern, block_lines[-1].strip()) < 0.80:
+            continue
+
+        all_match = True
         for p_line, c_line in zip(pattern_lines, block_lines):
-            sim = SequenceMatcher(None, p_line.strip(), c_line.strip()).ratio()
-            if sim >= 0.80:
-                high_similarity_count += 1
-        
-        # Need at least 50% of lines to have high similarity
-        if high_similarity_count >= len(pattern_lines) * 0.5:
+            pattern_line = p_line.strip()
+            if pattern_line and _similarity(pattern_line, c_line.strip()) < 0.80:
+                all_match = False
+                break
+
+        if all_match:
             start_pos, end_pos = _calculate_line_positions(
                 content_lines, i, i + pattern_line_count, len(content)
             )
             matches.append((start_pos, end_pos))
-    
+
     return matches
 
 

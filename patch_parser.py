@@ -109,17 +109,19 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
         - If successful: (list_of_operations, None)
         - If failed: ([], error_description)
     """
-    lines = patch_content.split('\n')
+    lines = [line[:-1] if line.endswith('\r') else line for line in patch_content.split('\n')]
     operations: List[PatchOperation] = []
-    
-    # Find patch boundaries
+
+    # Boundary markers must occupy the whole line. Content such as
+    # "+*** End Patch" is part of the target file, not the patch terminator.
     start_idx = None
     end_idx = None
-    
+    begin_marker = re.compile(r'^\*\*\*\s*Begin\s+Patch\s*$')
+    end_marker = re.compile(r'^\*\*\*\s*End\s+Patch\s*$')
     for i, line in enumerate(lines):
-        if '*** Begin Patch' in line or '***Begin Patch' in line:
+        if begin_marker.match(line):
             start_idx = i
-        elif '*** End Patch' in line or '***End Patch' in line:
+        elif end_marker.match(line):
             end_idx = i
             break
     
@@ -290,14 +292,27 @@ def _validate_operations(
 
     errors: List[str] = []
 
+    pending_content: dict[str, str] = {}
+    removed_paths: set[str] = set()
+
+    def _read(path: str) -> Tuple[Optional[str], Optional[str]]:
+        if path in removed_paths and path not in pending_content:
+            return None, "file not found"
+        if path in pending_content:
+            return pending_content[path], None
+        result = file_ops.read_file_raw(path)
+        if result.error:
+            return None, result.error
+        return result.content, None
+
     for op in operations:
         if op.operation == OperationType.UPDATE:
-            read_result = file_ops.read_file_raw(op.file_path)
-            if read_result.error:
-                errors.append(f"{op.file_path}: {read_result.error}")
+            content, read_error = _read(op.file_path)
+            if read_error:
+                errors.append(f"{op.file_path}: {read_error}")
                 continue
 
-            simulated = read_result.content
+            simulated = content or ""
             for hunk in op.hunks:
                 search_lines = [l.content for l in hunk.lines if l.prefix in {' ', '-'}]
                 if not search_lines:
@@ -343,24 +358,32 @@ def _validate_operations(
                     # Advance simulation so subsequent hunks validate correctly.
                     # Reuse the result from the call above — no second fuzzy run.
                     simulated = new_simulated
+            pending_content[op.file_path] = simulated
 
         elif op.operation == OperationType.DELETE:
-            read_result = file_ops.read_file_raw(op.file_path)
-            if read_result.error:
+            _content, read_error = _read(op.file_path)
+            if read_error:
                 errors.append(f"{op.file_path}: file not found for deletion")
+            else:
+                pending_content.pop(op.file_path, None)
+                removed_paths.add(op.file_path)
 
         elif op.operation == OperationType.MOVE:
             if not op.new_path:
                 errors.append(f"{op.file_path}: MOVE operation missing destination path")
                 continue
-            src_result = file_ops.read_file_raw(op.file_path)
-            if src_result.error:
+            source_content, source_error = _read(op.file_path)
+            if source_error:
                 errors.append(f"{op.file_path}: source file not found for move")
-            dst_result = file_ops.read_file_raw(op.new_path)
-            if not dst_result.error:
+            _destination_content, destination_error = _read(op.new_path)
+            if not destination_error:
                 errors.append(
                     f"{op.new_path}: destination already exists — move would overwrite"
                 )
+            if not source_error and destination_error:
+                pending_content[op.new_path] = source_content or ""
+                pending_content.pop(op.file_path, None)
+                removed_paths.add(op.file_path)
 
         # ADD: parent directory creation handled by write_file; no pre-check needed.
 
